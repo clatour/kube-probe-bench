@@ -32,6 +32,8 @@ func main() {
 	}
 
 	platform := platforms.DefaultSpec()
+	// Always, for now
+	platform.OS = "linux"
 
 	log.Printf("ensuring image '%s' is pulled\n", image)
 	rc, err := cli.ImagePull(context.Background(), image, types.ImagePullOptions{Platform: platform.Architecture})
