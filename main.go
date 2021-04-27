@@ -3,12 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/containerd/containerd/platforms"
@@ -16,31 +17,48 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 func main() {
-	var wg sync.WaitGroup
+	durations := [5]time.Duration{}
+	image := os.Args[1]
+	port := os.Args[2]
+	endpoint := os.Args[3]
 
-	for _, m := range []int{500, 1000, 1500, 2000} {
-		wg.Add(1)
-		go Run(os.Args[1], m, &wg)
-	}
-
-	wg.Wait()
-}
-
-func Run(image string, millicores int, wg *sync.WaitGroup) {
-	defer wg.Done()
-	cli, err := client.NewEnvClient()
+	cli, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
+	platform := platforms.DefaultSpec()
+
+	log.Printf("ensuring image '%s' is pulled\n", image)
+	rc, err := cli.ImagePull(context.Background(), image, types.ImagePullOptions{Platform: platform.Architecture})
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	// Discard whatever body the docker cli gives back
+	io.Copy(io.Discard, rc)
+	rc.Close()
+
+	for i, m := range []int{500, 1000, 1500, 2000, 4000} {
+		durations[i] = Run(cli, platform, image, port, endpoint, m)
+	}
+
+	for i := 0; i < len(durations)-1; i++ {
+		diff := durations[i+1] - durations[i]
+		log.Println(diff)
+	}
+}
+
+func Run(cli *client.Client, platform v1.Platform, image, port, endpoint string, millicores int) time.Duration {
 	hostBinding := nat.PortBinding{
 		HostIP: "0.0.0.0",
 	}
 
-	containerPort, err := nat.NewPort("tcp", "9000")
+	containerPort, err := nat.NewPort("tcp", port)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -49,7 +67,6 @@ func Run(image string, millicores int, wg *sync.WaitGroup) {
 		containerPort: []nat.PortBinding{hostBinding},
 	}
 
-	platform := platforms.DefaultSpec()
 	c, err := cli.ContainerCreate(
 		context.Background(),
 		&container.Config{
@@ -63,6 +80,7 @@ func Run(image string, millicores int, wg *sync.WaitGroup) {
 			},
 			AutoRemove: true,
 		}, nil, &platform, "")
+
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -86,13 +104,18 @@ func Run(image string, millicores int, wg *sync.WaitGroup) {
 
 	inspect, err := cli.ContainerInspect(context.Background(), c.ID)
 	hostmap := inspect.NetworkSettings.Ports[containerPort][0]
-	url := fmt.Sprintf("http://%s:%s/status", hostmap.HostIP, hostmap.HostPort)
-	log.Printf("%s: starting checker against '%s' with %dm CPU\n", inspect.Name, url, millicores)
+	u, err := url.Parse(fmt.Sprintf("http://%s:%s%s", hostmap.HostIP, hostmap.HostPort, endpoint))
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	log.Printf("%s (%dm cpu): starting probe against '%s'\n", inspect.Name, millicores, u)
 	for {
-		resp, _ := statusChecker.Get(url)
+		resp, _ := statusChecker.Get(u.String())
 		if resp != nil && err == nil && resp.StatusCode == http.StatusOK {
-			log.Printf("%s: success got, took %s\n", inspect.Name, time.Now().Sub(start))
-			break
+			duration := time.Now().Sub(start)
+			log.Printf("%s (%dm cpu): success after '%s'\n", inspect.Name, millicores, duration)
+			return duration
 		}
 
 		time.Sleep(1 * time.Second)
